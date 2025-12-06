@@ -25,12 +25,14 @@ EMBED_DIM = 128
 # Helper Functions
 # ------------------------
 
-def clean_text(t):
+
+def clean_text(t: str) -> str:
     t = t.lower()
     t = re.sub(r"http\S+|www\S+|https\S+", " url ", t)
     t = re.sub(r"[^a-z0-9\s]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
+
 
 def build_model():
     model = Sequential()
@@ -42,6 +44,7 @@ def build_model():
     model.add(Dense(1, activation="sigmoid"))
     model.compile(loss="binary_crossentropy", optimizer="adam", metrics=["accuracy"])
     return model
+
 
 def lime_explain(model, tokenizer, text):
     explainer = LimeTextExplainer(class_names=["Original", "AI Generated"])
@@ -55,9 +58,97 @@ def lime_explain(model, tokenizer, text):
     exp = explainer.explain_instance(
         text_instance=text,
         classifier_fn=pred_fn,
-        num_features=10
+        num_features=10,
     )
     return exp
+
+
+# --------- automatic column / label handling ----------
+
+
+def detect_text_column(df: pd.DataFrame) -> str:
+    candidates = ["text_", "review_text", "text", "content", "review"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise ValueError("No text column detected in dataset")
+
+
+def detect_label_column(df: pd.DataFrame) -> str:
+    candidates = ["label", "review_type", "class"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise ValueError("No label/target column detected in dataset")
+
+
+def detect_category_column(df: pd.DataFrame):
+    candidates = ["category", "product_category", "duct_categ", "duct_category", "category_name"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def detect_rating_column(df: pd.DataFrame):
+    candidates = ["rating", "stars", "score"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def normalize_labels(series: pd.Series) -> pd.Series:
+    mapping = {
+        "cg": 1,
+        "ai": 1,
+        "computer generated": 1,
+        "gpt": 1,
+        "gpt-4": 1,
+        "gpt4": 1,
+        "chatgpt": 1,
+        "or": 0,
+        "original": 0,
+        "human": 0,
+    }
+
+    def map_label(x):
+        x_str = str(x).strip().lower()
+        # numeric labels: assume 0 = human, 1 = AI
+        if x_str.isdigit():
+            return int(x_str)
+        if x_str in mapping:
+            return mapping[x_str]
+        raise ValueError(f"Unknown label value: {x}")
+
+    return series.apply(map_label)
+
+
+def load_and_standardize_csv(file) -> pd.DataFrame:
+    df = pd.read_csv(file)
+
+    text_col = detect_text_column(df)
+    label_col = detect_label_column(df)
+    cat_col = detect_category_column(df)
+    rating_col = detect_rating_column(df)
+
+    out = pd.DataFrame()
+    out["text_"] = df[text_col].astype(str).apply(clean_text)
+    out["label"] = normalize_labels(df[label_col])
+
+    # Optional metadata, used for filters if present
+    if cat_col:
+        out["category"] = df[cat_col].astype(str)
+    else:
+        out["category"] = "Unknown"
+
+    if rating_col:
+        out["rating"] = df[rating_col]
+    else:
+        out["rating"] = np.nan
+
+    return out
+
 
 # ------------------------
 # UI DESIGN
@@ -65,7 +156,7 @@ def lime_explain(model, tokenizer, text):
 st.set_page_config(
     page_title="Fake Review Detector",
     page_icon="🧠",
-    layout="wide"
+    layout="wide",
 )
 
 # ---- Session state init ----
@@ -77,195 +168,228 @@ if "tokenizer" not in st.session_state:
 st.title("🧠 AI-Generated Review Detector")
 st.caption("Bi-directional RNN + LIME Explainability")
 
-uploaded = st.sidebar.file_uploader("📌 Upload Dataset CSV", type=["csv"])
+# multiple dataset uploader
+uploaded_files = st.sidebar.file_uploader(
+    "📌 Upload one or more CSV datasets",
+    type=["csv"],
+    accept_multiple_files=True,
+)
 
-if uploaded:
-    df = pd.read_csv(uploaded)
+if not uploaded_files:
+    st.info("Upload one or more CSV files to begin.")
+    st.stop()
 
-    required_cols = ["label", "text_", "category", "rating"]
-    if not all(c in df.columns for c in required_cols):
-        st.error(f"Dataset must include: {required_cols}")
-        st.stop()
+# ------------------------
+# Load & combine datasets
+# ------------------------
+df_list = []
+for f in uploaded_files:
+    try:
+        df_part = load_and_standardize_csv(f)
+        df_list.append(df_part)
+        st.sidebar.success(f"Loaded: {f.name}")
+    except Exception as e:
+        st.sidebar.error(f"{f.name}: {e}")
 
-    # Map labels
-    label_map = {"CG": 1, "OR": 0}
-    df["label"] = df["label"].map(label_map)
-    df["text_"] = df["text_"].astype(str).apply(clean_text)
+if not df_list:
+    st.error("No valid datasets loaded.")
+    st.stop()
 
-    st.subheader("📊 Dataset Preview")
-    st.dataframe(df.head())
+df_all = pd.concat(df_list, ignore_index=True)
 
-    # ------------------------
-    # Filters
-    # ------------------------
-    st.sidebar.subheader("Filter before training")
+st.subheader("📊 Combined Dataset Preview")
+st.write(f"Total samples: **{len(df_all)}**")
+st.dataframe(df_all.head())
 
-    selected_cats = st.sidebar.multiselect(
-        "Select Categories to include",
-        options=df["category"].unique(),
-        default=list(df["category"].unique())
-    )
+st.write("Label distribution (0 = Original/Human, 1 = AI/CG):")
+st.bar_chart(df_all["label"].value_counts())
 
-    selected_ratings = st.sidebar.multiselect(
-        "Select Ratings",
-        options=sorted(df["rating"].unique()),
-        default=sorted(df["rating"].unique())
-    )
+# ------------------------
+# Optional Filters (category / rating)
+# ------------------------
+df_filtered = df_all.copy()
 
-    df_filtered = df[df["category"].isin(selected_cats)]
-    df_filtered = df_filtered[df_filtered["rating"].isin(selected_ratings)]
+st.sidebar.subheader("Filter before training")
 
-    if df_filtered.empty:
-        st.warning("No results found with filters.")
-        st.stop()
+if "category" in df_all.columns:
+    categories = sorted(df_all["category"].dropna().unique())
+    if categories:
+        selected_cats = st.sidebar.multiselect(
+            "Select Categories to include",
+            options=categories,
+            default=categories,
+        )
+        df_filtered = df_filtered[df_filtered["category"].isin(selected_cats)]
 
-    st.write(f"📂 Filtered dataset size: **{len(df_filtered)} records**")
+if "rating" in df_all.columns and df_all["rating"].notna().any():
+    ratings = sorted(df_all["rating"].dropna().unique())
+    if len(ratings) > 0:
+        selected_ratings = st.sidebar.multiselect(
+            "Select Ratings",
+            options=list(ratings),
+            default=list(ratings),
+        )
+        df_filtered = df_filtered[df_filtered["rating"].isin(selected_ratings)]
 
-    texts = df_filtered["text_"].tolist()
-    labels = df_filtered["label"].values
+if df_filtered.empty:
+    st.warning("No records left after applying filters.")
+    st.stop()
 
-    X_train_txt, X_test_txt, y_train, y_test = train_test_split(
-        texts, labels, test_size=0.2, random_state=42, stratify=labels
-    )
+st.write(f"📂 Filtered dataset size: **{len(df_filtered)} records**")
 
-    tokenizer = Tokenizer(num_words=MAX_WORDS, oov_token="<OOV>")
-    tokenizer.fit_on_texts(X_train_txt)
+texts = df_filtered["text_"].tolist()
+labels = df_filtered["label"].values
 
-    X_train = pad_sequences(tokenizer.texts_to_sequences(X_train_txt), maxlen=MAX_LEN)
-    X_test = pad_sequences(tokenizer.texts_to_sequences(X_test_txt), maxlen=MAX_LEN)
+# ------------------------
+# Train / Test Split & Tokenization
+# ------------------------
+X_train_txt, X_test_txt, y_train, y_test = train_test_split(
+    texts,
+    labels,
+    test_size=0.2,
+    random_state=42,
+    stratify=labels,
+)
 
-    # ------------------------
-    # Model buttons
-    # ------------------------
-    st.sidebar.divider()
+tokenizer = Tokenizer(num_words=MAX_WORDS, oov_token="<OOV>")
+tokenizer.fit_on_texts(X_train_txt)
 
-    if st.sidebar.button("🟦 Train New Model"):
-        model = build_model()
-        with st.spinner("Training model..."):
-            model.fit(
-                X_train,
-                y_train,
-                validation_split=0.2,
-                epochs=5,
-                batch_size=64,
-                verbose=1
-            )
-        model.save(MODEL_PATH)
+X_train = pad_sequences(tokenizer.texts_to_sequences(X_train_txt), maxlen=MAX_LEN)
+X_test = pad_sequences(tokenizer.texts_to_sequences(X_test_txt), maxlen=MAX_LEN)
+
+# ------------------------
+# Model buttons
+# ------------------------
+st.sidebar.divider()
+
+if st.sidebar.button("🟦 Train New Model"):
+    model = build_model()
+    with st.spinner("Training model..."):
+        model.fit(
+            X_train,
+            y_train,
+            validation_split=0.2,
+            epochs=5,
+            batch_size=64,
+            verbose=1,
+        )
+    model.save(MODEL_PATH)
+    st.session_state.model = model
+    st.session_state.tokenizer = tokenizer
+    st.success("Model trained and saved as best_model.h5")
+
+if st.sidebar.button("🟩 Load Saved Model"):
+    if os.path.exists(MODEL_PATH):
+        model = load_model(MODEL_PATH)
         st.session_state.model = model
-        st.session_state.tokenizer = tokenizer
-        st.success("Model trained and saved as best_model.h5")
+        st.session_state.tokenizer = tokenizer  # tokenizer based on current data
+        st.success("Model loaded successfully.")
+    else:
+        st.error("No saved model found. Train first.")
 
-    if st.sidebar.button("🟩 Load Saved Model"):
-        if os.path.exists(MODEL_PATH):
-            model = load_model(MODEL_PATH)
-            st.session_state.model = model
-            st.session_state.tokenizer = tokenizer  # tokenizer built from this dataset
-            st.success("Model loaded successfully.")
-        else:
-            st.error("No model found. Train first.")
+# ------------------------
+# Evaluation & Prediction
+# ------------------------
+model = st.session_state.model
 
-    # ------------------------
-    # Evaluation & Prediction
-    # ------------------------
-    model = st.session_state.model
+if model is not None:
+    tok = st.session_state.tokenizer or tokenizer
 
-    if model is not None:
-        tok = st.session_state.tokenizer or tokenizer
+    st.subheader("📑 Model Performance")
 
-        st.subheader("📑 Model Performance")
+    loss, acc = model.evaluate(X_test, y_test, verbose=0)
 
-        loss, acc = model.evaluate(X_test, y_test, verbose=0)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Accuracy", f"{acc:.4f}")
+    with col2:
+        st.metric("Loss", f"{loss:.4f}")
+
+    y_pred = (model.predict(X_test) > 0.5).astype(int)
+
+    st.code(classification_report(y_test, y_pred), language="text")
+
+    st.write("Confusion Matrix:")
+    st.write(confusion_matrix(y_test, y_pred))
+
+    st.divider()
+    st.subheader("🔍 Test a Review")
+
+    user_text = st.text_area("Enter review text:")
+
+    if user_text:
+        cleaned = clean_text(user_text)
+        seq = tok.texts_to_sequences([cleaned])
+        pad_seq = pad_sequences(seq, maxlen=MAX_LEN)
+        prob = model.predict(pad_seq)[0][0]
+
+        label = "AI-Generated" if prob >= 0.5 else "Original"
+        color = "#ffcccc" if prob >= 0.5 else "#ccffcc"
+
+        st.markdown(
+            f"""
+            <div style="padding:15px;border-radius:10px;background:{color}">
+            <h3 style="margin:0;">{label}</h3>
+            <p>Probability: <b>{prob:.4f}</b></p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # ------------------------
+        # CLEAN EXPLAINABILITY
+        # ------------------------
+        st.write("### Explainability (Clean View)")
+
+        exp = lime_explain(model, tok, cleaned)
+
+        # Get weighted words
+        weights = exp.as_list()
+
+        # Separate contributions
+        ai_words = [w for w, v in weights if v > 0]
+        human_words = [w for w, v in weights if v < 0]
 
         col1, col2 = st.columns(2)
         with col1:
-            st.metric("Accuracy", f"{acc:.4f}")
+            st.markdown("#### 🔶 Indicates AI-style")
+            st.write(", ".join(ai_words[:8]) if ai_words else "None")
+
         with col2:
-            st.metric("Loss", f"{loss:.4f}")
+            st.markdown("#### 🔷 Indicates Human-style")
+            st.write(", ".join(human_words[:8]) if human_words else "None")
 
-        y_pred = (model.predict(X_test) > 0.5).astype(int)
+        # Highlight words
+        def highlight_text(text, ai_words, human_words):
+            result = text.split()
+            final = []
 
-        st.code(classification_report(y_test, y_pred), language="text")
+            ai_set = {a.lower() for a in ai_words}
+            human_set = {h.lower() for h in human_words}
 
-        st.write("Confusion Matrix:")
-        st.write(confusion_matrix(y_test, y_pred))
+            for word in result:
+                w = word.lower().strip(".,!?")
 
-        st.divider()
-        st.subheader("🔍 Test a Review")
+                if w in ai_set:
+                    final.append(
+                        f"<span style='background-color:#ffb347;padding:2px 4px;border-radius:4px;'>{word}</span>"
+                    )
+                elif w in human_set:
+                    final.append(
+                        f"<span style='background-color:#6bb4ff;padding:2px 4px;border-radius:4px;'>{word}</span>"
+                    )
+                else:
+                    final.append(word)
 
-        user_text = st.text_area("Enter review text:")
-        if user_text:
-            cleaned = clean_text(user_text)
-            seq = tok.texts_to_sequences([cleaned])
-            pad_seq = pad_sequences(seq, maxlen=MAX_LEN)
-            prob = model.predict(pad_seq)[0][0]
+            return " ".join(final)
 
-            label = "AI-Generated" if prob >= 0.5 else "Original"
-            color = "#ffcccc" if prob >= 0.5 else "#ccffcc"
+        highlighted = highlight_text(user_text, ai_words, human_words)
 
-            st.markdown(
-                f"""
-                <div style="padding:15px;border-radius:10px;background:{color}">
-                <h3 style="margin:0;">{label}</h3>
-                <p>Probability: <b>{prob:.4f}</b></p>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+        st.markdown("#### Highlighted Sentence Interpretation", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='font-size:18px;line-height:1.7;margin-top:10px'>{highlighted}</div>",
+            unsafe_allow_html=True,
+        )
 
-            # ------------------------
-            # CLEAN EXPLAINABILITY
-            # ------------------------
-            st.write("### Explainability (Clean View)")
-
-            exp = lime_explain(model, tok, cleaned)
-
-            # Get weighted words
-            weights = exp.as_list()
-
-            # Separate contributions
-            ai_words = [w for w, v in weights if v > 0]
-            human_words = [w for w, v in weights if v < 0]
-
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("#### 🔶 Indicates AI-style")
-                st.write(", ".join(ai_words[:8]) if ai_words else "None")
-
-            with col2:
-                st.markdown("#### 🔷 Indicates Human-style")
-                st.write(", ".join(human_words[:8]) if human_words else "None")
-
-            # Highlight words
-            def highlight_text(text, ai_words, human_words):
-                result = text.split()
-                final = []
-
-                for word in result:
-                    w = word.lower().strip(".,!?")
-
-                    if w in [a.lower() for a in ai_words]:
-                        final.append(
-                            f"<span style='background-color:#ffb347;padding:2px 4px;border-radius:4px;'>{word}</span>"
-                        )
-                    elif w in [h.lower() for h in human_words]:
-                        final.append(
-                            f"<span style='background-color:#6bb4ff;padding:2px 4px;border-radius:4px;'>{word}</span>"
-                        )
-                    else:
-                        final.append(word)
-
-                return " ".join(final)
-
-            highlighted = highlight_text(user_text, ai_words, human_words)
-
-            st.markdown("#### Highlighted Sentence Interpretation", unsafe_allow_html=True)
-            st.markdown(
-                f"<div style='font-size:18px;line-height:1.7;margin-top:10px'>{highlighted}</div>",
-                unsafe_allow_html=True
-            )
-
-            
-    else:
-        st.info("Train or load a model to enable evaluation and prediction.")
 else:
-    st.info("Upload CSV to begin.")
+    st.info("Train or load a model to enable evaluation and prediction.")
